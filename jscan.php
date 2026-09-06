@@ -11,6 +11,7 @@ const JSCAN_KEY = 'change-this-key';
 const JSCAN_TIME_BUDGET = 18.0;
 const JSCAN_SCAN_BATCH = 280;
 const JSCAN_CHMOD_BATCH = 450;
+const JSCAN_HTACCESS_BATCH = 80;
 
 if (!isset($_GET['key']) || !hash_equals(JSCAN_KEY, (string) $_GET['key'])) {
     header('HTTP/1.1 403 Forbidden');
@@ -221,6 +222,7 @@ function jscan_collect_paths(string $root, array $skipContent, string $self): ar
 {
     $scan = [];
     $chmod = [];
+    $nestedHt = [];
     $it = new RecursiveIteratorIterator(
         new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS),
         RecursiveIteratorIterator::SELF_FIRST,
@@ -233,15 +235,34 @@ function jscan_collect_paths(string $root, array $skipContent, string $self): ar
             $chmod[] = $rel;
             continue;
         }
-        if ($item->getFilename() === $self) {
+        $name = $item->getFilename();
+        if ($name === $self) {
             continue;
         }
         $chmod[] = $rel;
-        if (!jscan_skip_content($rel, $skipContent)) {
+        $isHt = strcasecmp($name, '.htaccess') === 0;
+        if ($isHt && jscan_is_nested_htaccess($rel)) {
+            $nestedHt[] = $rel;
+        }
+        if ($isHt || !jscan_skip_content($rel, $skipContent)) {
             $scan[] = $rel;
         }
     }
-    return ['scan' => $scan, 'chmod' => $chmod];
+    return ['scan' => $scan, 'chmod' => $chmod, 'nested_htaccess' => $nestedHt];
+}
+
+function jscan_is_nested_htaccess(string $rel): bool
+{
+    if (strcasecmp(basename($rel), '.htaccess') !== 0) {
+        return false;
+    }
+    if ($rel === '/.htaccess') {
+        return false;
+    }
+    if (stripos($rel, '/tmp/jscan-') !== false) {
+        return false;
+    }
+    return true;
 }
 
 function jscan_is_protected(string $rel, array $entry): bool
@@ -256,6 +277,58 @@ function jscan_is_protected(string $rel, array $entry): bool
         return true;
     }
     return false;
+}
+
+function jscan_htaccess_is_hack(string $buf): bool
+{
+    if ($buf === '') {
+        return false;
+    }
+    $allowBackdoors = preg_match('/adminfuns\.php|chtmlfuns\.php|cjfuns\.php|classsmtps\.php|comdofuns\.php|epinyins\.php|gdftps\.php|hplfuns\.php|onclickfuns\.php|phpzipincs\.php|schallfuns\.php|siteheads\.php|termps\.php|txets\.php|thoms\.php|copypaths\.php|delpaths\.php/i', $buf);
+    $caseSoup = preg_match('/FilesMatch[^>\n]{0,400}(?:pHP7|PHP7|Php\|PHp|php5\|suspected|suspected\)\$)/i', $buf)
+        || preg_match('/FilesMatch[^\n]+suspected/i', $buf);
+    $denyThenWpAllow = preg_match('/FilesMatch/i', $buf)
+        && preg_match('/Deny from all/i', $buf)
+        && preg_match('/Allow from all/i', $buf)
+        && preg_match('/wp-login\.php|wp-blog-header\.php|wp-trackback\.php/i', $buf);
+    return (bool) ($allowBackdoors || $caseSoup || $denyThenWpAllow);
+}
+
+function jscan_default_htaccess(string $root): string
+{
+    $joomlaTxt = $root . '/htaccess.txt';
+    if (is_file($joomlaTxt)) {
+        $txt = (string) @file_get_contents($joomlaTxt);
+        if ($txt !== '' && !jscan_htaccess_is_hack($txt)) {
+            return $txt;
+        }
+    }
+    if (is_file($root . '/wp-config.php') && !is_file($root . '/configuration.php')) {
+        return "# Restored by jscan (WordPress default)\n<IfModule mod_rewrite.c>\nRewriteEngine On\nRewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]\nRewriteBase /\nRewriteRule ^index\\.php$ - [L]\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule . /index.php [L]\n</IfModule>\n";
+    }
+    return "# Restored by jscan (Joomla minimal)\nOptions -Indexes\n<IfModule mod_rewrite.c>\nRewriteEngine On\nRewriteBase /\nRewriteRule ^index\\.php$ - [L]\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule . index.php [L]\n</IfModule>\n";
+}
+
+function jscan_restore_htaccess(string $root, string $quar, string $rel): array
+{
+    $src = $root . $rel;
+    if (!is_file($src)) {
+        return ['ok' => false, 'error' => 'нет файла'];
+    }
+    $dest = $quar . $rel;
+    if (!jscan_mkdir(dirname($dest))) {
+        return ['ok' => false, 'error' => 'карантин не создан'];
+    }
+    if (!@copy($src, $dest)) {
+        return ['ok' => false, 'error' => 'копия в карантин не удалась'];
+    }
+    @file_put_contents($dest . '.reason.txt', "malware htaccess\n");
+    $body = jscan_default_htaccess($root);
+    if (@file_put_contents($src, $body) === false) {
+        return ['ok' => false, 'error' => 'запись нового .htaccess не удалась, оригинал в карантине'];
+    }
+    @chmod($src, 0644);
+    return ['ok' => true, 'error' => ''];
 }
 
 function jscan_inspect(string $root, string $rel, array $ctx): ?array
@@ -297,6 +370,12 @@ function jscan_inspect(string $root, string $rel, array $ctx): ?array
         || preg_match('/\.(jpg|jpeg|png|gif|ico|txt|pdf)\.(php[0-9]?|pht|phtml|phar)$/i', $name)) {
         $issue = 'bad_name';
         $reason = 'двойное расширение';
+        $high = true;
+    }
+    if (preg_match('/^(adminfuns|chtmlfuns|cjfuns|classsmtps|classfuns|comfunctions|comdofuns|copypaths|delpaths|doiconvs|epinyins|filefuns|gdftps|hinfofuns|hplfuns|memberfuns|moddofuns|onclickfuns|phpzipincs|qfunctions|qinfofuns|schallfuns|tempfuns|userfuns|siteheads|termps|txets|thoms|postnews)\.php$/i', $name)
+        || ($rel === '/inputs.php' || $rel === '/system_log.php')) {
+        $issue = 'bad_name';
+        $reason = 'типичное имя бэкдора из взломанного .htaccess';
         $high = true;
     }
 
@@ -341,7 +420,11 @@ function jscan_inspect(string $root, string $rel, array $ctx): ?array
     }
 
     if (in_array($name, ['.htaccess', '.user.ini', 'php.ini'], true) || $ext === 'ini') {
-        if ($buf !== '' && preg_match('/auto_prepend_file|auto_append_file|AddHandler\s+application\/x-httpd-php|SetHandler\s+application\/x-httpd-php/i', $buf)) {
+        if ($buf !== '' && jscan_htaccess_is_hack($buf)) {
+            $issue = 'htaccess';
+            $reason = 'взломанный .htaccess: запрет PHP + белый список wp/бэкдоров';
+            $high = true;
+        } elseif ($buf !== '' && preg_match('/auto_prepend_file|auto_append_file|AddHandler\s+application\/x-httpd-php|SetHandler\s+application\/x-httpd-php/i', $buf)) {
             if (!($rel === '/.htaccess' && preg_match('/Joomla/i', $buf) && !preg_match('/auto_prepend_file/i', $buf))) {
                 $issue = $issue ?: 'htaccess';
                 $reason = $reason ?: 'опасные директивы prepend/handler';
@@ -350,6 +433,13 @@ function jscan_inspect(string $root, string $rel, array $ctx): ?array
         if ($rel === '/.user.ini' && $buf !== '' && preg_match('/auto_prepend_file\s*=\s*(?!none\b)(?!\s*$).+/i', $buf)) {
             $issue = 'userini';
             $reason = 'auto_prepend указывает на файл';
+            $high = true;
+        }
+        if (jscan_is_nested_htaccess($rel)) {
+            $issue = 'htaccess';
+            $reason = ($buf !== '' && jscan_htaccess_is_hack($buf))
+                ? 'вложенный взломанный .htaccess'
+                : 'вложенный .htaccess';
             $high = true;
         }
     }
@@ -381,6 +471,7 @@ function jscan_inspect(string $root, string $rel, array $ctx): ?array
         'high' => $high,
         'size' => $size,
         'snippet' => jscan_snippet($buf !== '' ? $buf : $reason),
+        'restore_htaccess' => ($name === '.htaccess' && $high && $issue === 'htaccess' && $rel === '/.htaccess'),
     ];
 }
 
@@ -441,9 +532,14 @@ function jscan_build_reports(string $root, array $state, string $jsonPath, strin
     $findings = $state['findings'] ?? [];
     $procs = $state['processes'] ?? [];
     $deleted = [];
+    $restoredHt = false;
     foreach ($actions as $a) {
-        if (($a['type'] ?? '') === 'deleted') {
+        $t = $a['type'] ?? '';
+        if ($t === 'deleted' || $t === 'restored') {
             $deleted[$a['path'] ?? ''] = true;
+        }
+        if ($t === 'restored' && ($a['path'] ?? '') === '/.htaccess') {
+            $restoredHt = true;
         }
     }
     $needs = [];
@@ -468,6 +564,9 @@ function jscan_build_reports(string $root, array $state, string $jsonPath, strin
     $next[] = 'Скачайте JSON-рапорт и удалите jscan.php с хостинга.';
     if ($deniedPids) {
         $next[] = 'Напишите в поддержку хостинга: завершить PID ' . implode(', ', $deniedPids) . ' (PHP kill запрещён).';
+    }
+    if ($restoredHt) {
+        $next[] = 'Корневой .htaccess восстановлен из htaccess.txt (или минимальных правил). Проверьте свои HTTPS/редиректы — кастомные правила из взломанного файла не переносились.';
     }
     if ($needs) {
         $next[] = 'Локально откройте копию сайта и JSON: правьте только пути из needs_ai_fix.';
@@ -635,8 +734,12 @@ if ($step <= 1) {
         'processes' => [],
         'loadavg' => '',
         'chmod_stats' => ['dirs' => 0, 'files' => 0, 'fail' => 0],
+        'nested_htaccess' => [],
+        'nested_ht_i' => 0,
+        'nested_ht_done' => false,
         'list_done' => false,
         'scan_done' => false,
+        'clean_core_done' => false,
         'clean_done' => false,
         'chmod_done' => false,
     ];
@@ -688,12 +791,15 @@ if ($step === 2) {
         $lists = jscan_collect_paths($ROOT, $SKIP_FRAG, $SELF);
         $state['scan_paths'] = $lists['scan'];
         $state['chmod_paths'] = $lists['chmod'];
+        $state['nested_htaccess'] = $lists['nested_htaccess'];
+        $state['nested_ht_i'] = 0;
+        $state['nested_ht_done'] = false;
         $state['list_done'] = true;
         $state['scan_i'] = 0;
         jscan_save_state($STATE_FILE, $state);
         jscan_page_start('jscan шаг 2');
         echo '<h1>Шаг 2/4 — список файлов</h1>';
-        echo '<p>К скану: ' . count($lists['scan']) . ', к chmod: ' . count($lists['chmod']) . '</p>';
+        echo '<p>К скану: ' . count($lists['scan']) . ', вложенных .htaccess: ' . count($lists['nested_htaccess']) . ', к chmod: ' . count($lists['chmod']) . '</p>';
         echo '<meta http-equiv="refresh" content="1;url=' . jscan_h(jscan_url(['go' => '1', 'step' => '2'])) . '">';
         echo '<p>Продолжаю скан…</p>';
         jscan_page_end();
@@ -742,7 +848,7 @@ if ($step === 2) {
 }
 
 if ($step === 3) {
-    if (empty($state['clean_done'])) {
+    if (empty($state['clean_core_done'])) {
         $ini = $ROOT . '/.user.ini';
         $iniBody = is_file($ini) ? (string) file_get_contents($ini) : '';
         if ($iniBody !== '' && preg_match('/auto_prepend_file\s*=\s*[^\r\n]+/i', $iniBody, $mm)
@@ -772,10 +878,27 @@ if ($step === 3) {
         }
 
         foreach ($state['findings'] as $f) {
+            if (!empty($f['restore_htaccess']) && ($f['path'] ?? '') === '/.htaccess') {
+                $q = jscan_restore_htaccess($ROOT, $QUAR, '/.htaccess');
+                $state['actions'][] = [
+                    'type' => $q['ok'] ? 'restored' : 'failed',
+                    'path' => '/.htaccess',
+                    'reason' => 'взломанный .htaccess заменён на штатный' . ($q['error'] ? ' (' . $q['error'] . ')' : ' (карантин + htaccess.txt)'),
+                ];
+            }
+        }
+
+        foreach ($state['findings'] as $f) {
             if (empty($f['high'])) {
                 continue;
             }
             $rel = $f['path'];
+            if (!empty($f['restore_htaccess'])) {
+                continue;
+            }
+            if (jscan_is_nested_htaccess($rel)) {
+                continue;
+            }
             if (jscan_is_protected($rel, $ENTRY)) {
                 continue;
             }
@@ -786,11 +909,44 @@ if ($step === 3) {
                 'reason' => $f['reason'] . ($q['error'] ? ' (' . $q['error'] . ')' : ''),
             ];
         }
-        $state['clean_done'] = true;
+        $state['clean_core_done'] = true;
         jscan_save_state($STATE_FILE, $state);
         jscan_page_start('jscan шаг 3');
         echo '<h1>Шаг 3/4 — карантин</h1>';
-        echo '<p>Действий: ' . count($state['actions']) . '. Дальше права 0755/0644.</p>';
+        echo '<p>Действий: ' . count($state['actions']) . '. Дальше вложенные .htaccess.</p>';
+        echo '<meta http-equiv="refresh" content="1;url=' . jscan_h(jscan_url(['go' => '1', 'step' => '3'])) . '">';
+        jscan_page_end();
+        exit;
+    }
+
+    if (empty($state['nested_ht_done'])) {
+        $htList = $state['nested_htaccess'] ?? [];
+        $hn = count($htList);
+        $hi = (int) ($state['nested_ht_i'] ?? 0);
+        $batch = 0;
+        while ($hi < $hn && $batch < JSCAN_HTACCESS_BATCH && microtime(true) < $DEADLINE) {
+            $rel = $htList[$hi];
+            if (jscan_is_nested_htaccess($rel) && is_file($ROOT . $rel)) {
+                $q = jscan_quarantine_delete($ROOT, $QUAR, $rel, 'вложенный .htaccess');
+                $state['actions'][] = [
+                    'type' => $q['ok'] ? 'deleted' : 'failed',
+                    'path' => $rel,
+                    'reason' => 'вложенный .htaccess' . ($q['error'] ? ' (' . $q['error'] . ')' : ''),
+                ];
+            }
+            $hi++;
+            $batch++;
+        }
+        $state['nested_ht_i'] = $hi;
+        if ($hi >= $hn) {
+            $state['nested_ht_done'] = true;
+            $state['clean_done'] = true;
+            jscan_ensure_tmp_htaccess($TMP);
+        }
+        jscan_save_state($STATE_FILE, $state);
+        jscan_page_start('jscan шаг 3');
+        echo '<h1>Шаг 3/4 — вложенные .htaccess</h1>';
+        echo '<p>' . $hi . ' / ' . $hn . ' удалено в карантин.</p>';
         echo '<meta http-equiv="refresh" content="1;url=' . jscan_h(jscan_url(['go' => '1', 'step' => '3'])) . '">';
         jscan_page_end();
         exit;
@@ -824,7 +980,7 @@ if ($step === 3) {
     $state['chmod_stats'] = $stats;
     if ($i >= $n) {
         @chmod($ROOT, 0755);
-        @chmod($ROOT . '/configuration.php', 0444);
+        @chmod($ROOT . '/configuration.php', 0644);
         @chmod(__FILE__, 0644);
         $state['chmod_done'] = true;
         $state['step'] = 4;
